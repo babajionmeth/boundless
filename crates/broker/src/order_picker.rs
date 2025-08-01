@@ -969,45 +969,64 @@ where
             }
         }
 
-        // Apply timing constraints based on peak prove khz
-        if let Some(peak_prove_khz) = peak_prove_khz {
-            let prove_window = request_expiration.saturating_sub(now);
-            let prove_deadline_limit = calculate_max_cycles_for_time(peak_prove_khz, prove_window);
-            if prove_limit > prove_deadline_limit {
-                tracing::debug!("Order {order_id} prove limit capped by deadline: {} -> {} cycles ({:.1}s at {} peak_prove_khz)", prove_limit, prove_deadline_limit, prove_window, peak_prove_khz);
-                prove_limit = prove_deadline_limit;
-            }
+        // Apply timing constraints based on peak prove khz, with +10s buffer
+if let Some(peak_prove_khz) = peak_prove_khz {
+    // Add 10s buffer to avoid late skips
+    let raw_window = request_expiration.saturating_sub(now);
+    let prove_window = raw_window.saturating_add(10);
 
-            // For preflight, also check fulfill-after-expiry window
-            let new_preflight_limit = if !is_fulfill_after_lock_expire {
-                let fulfill_after_expiry_window = order_expiry.saturating_sub(lock_expiry);
-                let fulfill_after_expiry_limit =
-                    calculate_max_cycles_for_time(peak_prove_khz, fulfill_after_expiry_window);
-                std::cmp::max(prove_deadline_limit, fulfill_after_expiry_limit)
-            } else {
-                prove_deadline_limit
-            };
+    // Cap prove_limit
+    let prove_deadline_limit =
+        calculate_max_cycles_for_time(peak_prove_khz, prove_window);
+    if prove_limit > prove_deadline_limit {
+        tracing::debug!(
+            "Order {order_id} prove limit capped by deadline: {} -> {} cycles \
+            ({}s+10s buffer at {} peak_prove_khz)",
+            prove_limit,
+            prove_deadline_limit,
+            raw_window,
+            peak_prove_khz
+        );
+        prove_limit = prove_deadline_limit;
+    }
 
-            if preflight_limit > new_preflight_limit {
-                tracing::debug!("Order {order_id} preflight limit capped by deadline: {} -> {} cycles ({:.1}s at {} peak_prove_khz)", preflight_limit, new_preflight_limit, prove_window, peak_prove_khz);
-                preflight_limit = new_preflight_limit;
-            }
-        }
+    // Cap preflight_limit (fulfill-after-expiry logic preserved)
+    let new_preflight_limit = if !is_fulfill_after_lock_expire {
+        let fulfill_after_expiry_window =
+            order_expiry.saturating_sub(lock_expiry).saturating_add(10);
+        let fulfill_after_expiry_limit =
+            calculate_max_cycles_for_time(peak_prove_khz, fulfill_after_expiry_window);
+        std::cmp::max(prove_deadline_limit, fulfill_after_expiry_limit)
+    } else {
+        prove_deadline_limit
+    };
 
-        tracing::trace!(
-            "Order {order_id} final limits - preflight: {} cycles, prove: {} cycles",
+    if preflight_limit > new_preflight_limit {
+        tracing::debug!(
+            "Order {order_id} preflight limit capped by deadline: {} -> {} cycles \
+            ({}s+10s buffer at {} peak_prove_khz)",
             preflight_limit,
-            prove_limit
+            new_preflight_limit,
+            raw_window,
+            peak_prove_khz
         );
-
-        debug_assert!(
-            preflight_limit >= prove_limit,
-            "preflight_limit ({preflight_limit}) < prove_limit ({prove_limit})",
-        );
-
-        Ok((preflight_limit, prove_limit))
+        preflight_limit = new_preflight_limit;
     }
 }
+
+tracing::trace!(
+    "Order {order_id} final limits - preflight: {} cycles, prove: {} cycles",
+    preflight_limit,
+    prove_limit
+);
+
+debug_assert!(
+    preflight_limit >= prove_limit,
+    "preflight_limit ({preflight_limit}) < prove_limit ({prove_limit})",
+);
+
+Ok((preflight_limit, prove_limit))
+
 
 /// Input type for preflight cache
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
