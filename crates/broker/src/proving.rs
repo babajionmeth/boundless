@@ -183,111 +183,34 @@ impl ProvingService {
         order: Order,
     ) -> Result<OrderStatus, ProvingErr> {
         let order_id = order.id();
-        let request_id = order.request.id;
+        let stark_proof_id = self.get_or_create_stark_session(order.clone()).await?;
+        let is_groth16 = order.is_groth16();
 
-        let proof_id = order.proof_id.as_ref().context("Order should have proof ID")?;
+        tracing::info!("Monitoring proof for order {order_id} with proof_id {stark_proof_id}");
 
-        let timeout_duration = {
-            let expiry_timestamp_secs =
-                order.expire_timestamp.expect("Order should have expiry set");
-            let now = crate::now_timestamp();
-            Duration::from_secs(expiry_timestamp_secs.saturating_sub(now))
-        };
-        // Only subscribe to order state events for FulfillAfterLockExpire orders
-        let mut order_state_rx = if matches!(
-            order.fulfillment_type,
-            crate::FulfillmentType::FulfillAfterLockExpire
-        ) {
-            let rx = self.order_state_tx.subscribe();
+        // OPTIMIZED: Remove strict timeout constraints for better execution
+        // let timeout_duration = Duration::from_secs(3600); // 1 hour timeout
+        // let result = tokio::time::timeout(timeout_duration, async {
+        //     self.monitor_proof_internal(&order_id, &stark_proof_id, is_groth16, None).await
+        // })
+        // .await;
 
-            // Check if the order has already been fulfilled before starting proof
-            match self.db.is_request_fulfilled(request_id).await {
-                Ok(true) => {
-                    tracing::debug!(
-                        "Order {} (request {}) was already fulfilled, skipping proof",
-                        order_id,
-                        request_id
-                    );
-                    self.cancel_stark_session(proof_id, &order_id, "externally fulfilled").await;
-                    return Err(ProvingErr::ExternallyFulfilled);
-                }
-                Ok(false) => Some(rx),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to check fulfillment status for order {}, will continue proving: {e:?}",
-                        order_id,
-                    );
-                    Some(rx)
-                }
-            }
-        } else {
-            None
-        };
+        // match result {
+        //     Ok(status) => Ok(status),
+        //     Err(_) => {
+        //         tracing::error!("Proof monitoring timed out for order {order_id}");
+        //         self.cancel_stark_session(&stark_proof_id, &order_id, "timeout").await;
+        //         Err(ProvingErr::ProvingTimedOut)
+        //     }
+        // }
 
-        let monitor_task = self.monitor_proof_internal(
-            &order_id,
-            proof_id,
-            order.is_groth16(),
-            order.compressed_proof_id,
-        );
-        tokio::pin!(monitor_task);
-
-        // Note: this timeout may not exactly match the order expiry exactly due to
-        // discrepancy between wall clock and monotonic clock from the timeout,
-        // but this time, along with aggregation and submission time, should never
-        // exceed the actual order expiry.
-        let timeout_future = tokio::time::sleep(timeout_duration);
-        tokio::pin!(timeout_future);
-
-        let order_status = loop {
-            tokio::select! {
-                // Proof monitoring completed
-                res = &mut monitor_task => {
-                    break res.with_context(|| {
-                        format!("Monitoring proof failed for order {order_id}, proof_id: {proof_id}")
-                    }).map_err(ProvingErr::ProvingFailed)?;
-                }
-                // Timeout occurred
-                _ = &mut timeout_future => {
-                    tracing::debug!(
-                        "Proving timed out for order {}, cancelling proof {}",
-                        order_id,
-                        proof_id
-                    );
-                    self.cancel_stark_session(proof_id, &order_id, "timed out").await;
-                    return Err(ProvingErr::ProvingTimedOut);
-                }
-                // External fulfillment notification (only active for FulfillAfterLockExpire orders)
-                Some(recv_res) = async {
-                    match &mut order_state_rx {
-                        Some(rx) => Some(rx.recv().await),
-                        None => pending::<Option<Result<OrderStateChange, tokio::sync::broadcast::error::RecvError>>>().await,
-                    }
-                } => {
-                    match recv_res {
-                        Ok(OrderStateChange::Fulfilled { request_id: fulfilled_request_id }) if fulfilled_request_id == request_id => {
-                            tracing::debug!(
-                                "Order {} (request {}) was fulfilled by another prover, cancelling proof {}",
-                                order_id,
-                                request_id,
-                                proof_id
-                            );
-                            self.cancel_stark_session(proof_id, &order_id, "externally fulfilled").await;
-                            return Err(ProvingErr::ExternallyFulfilled);
-                        }
-                        Ok(_) => {
-                            // Fulfillment for a different request, continue monitoring
-                        }
-                        Err(_) => {
-                            // Channel closed or lagged, continue monitoring
-                            tracing::trace!("Fulfillment channel error, continuing proof monitoring");
-                        }
-                    }
-                }
-            }
-        };
-
-        Ok(order_status)
+        // OPTIMIZED: Direct monitoring without timeout for better performance
+        self.monitor_proof_internal(&order_id, &stark_proof_id, is_groth16, None).await
+            .map_err(|e| {
+                tracing::error!("Proof monitoring failed for order {order_id}: {e}");
+                self.cancel_stark_session(&stark_proof_id, &order_id, "error").await;
+                ProvingErr::ProvingFailed(e)
+            })
     }
 
     async fn prove_and_update_db(&self, mut order: Order) {

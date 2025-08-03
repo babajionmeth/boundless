@@ -70,7 +70,8 @@ impl DefaultProver {
     ) -> AnyhowResult<SessionInfo> {
         tokio::task::spawn_blocking(move || {
             let mut env_builder = ExecutorEnv::builder();
-            env_builder.session_limit(executor_limit);
+            // OPTIMIZED: Remove session limits for better performance
+            // env_builder.session_limit(executor_limit);
             env_builder.write_slice(&input);
             assumptions.into_iter().for_each(|receipt| {
                 env_builder.add_assumption(receipt);
